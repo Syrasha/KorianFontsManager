@@ -206,7 +206,7 @@ class KorianFontsManagerApp:
         
         self.dragging_bbox_move = False
         self.dragging_bbox_edge = None
-        self.full_width_preview = True
+        self.full_width_preview = False
         self._wheel_timer = None
         self._cached_bg_image = None
         self._cached_bg_zoom = 0
@@ -238,83 +238,40 @@ class KorianFontsManagerApp:
     def setup_ui(self):
         # Bind virtual event for font updates
         self.root.bind("<<UpdateFonts>>", lambda e: self.update_font_lists())
-        
+
         # Bind Undo/Redo keys
         self.root.bind("<Control-z>", lambda e: self.undo())
         self.root.bind("<Control-Z>", lambda e: self.undo())
         self.root.bind("<Control-Shift-Z>", lambda e: self.redo())
         self.root.bind("<Control-Shift-z>", lambda e: self.redo())
 
-        # Persistent frames
-        self.left_frame = tk.Frame(self.root, bg=self.colors["sidebar_bg"], width=200)
-        self.center_frame = tk.Frame(self.root, bg=self.colors["bg"], width=400)
-        self.right_frame = tk.Frame(self.root, bg=self.colors["bg"], width=400)
-        self.bottom_frame = tk.Frame(self.root, bg=self.colors["sidebar_bg"])
-        
+        # Vertical Paned Window to separate main content from preview
+        self.vertical_paned = tk.PanedWindow(self.root, orient=tk.VERTICAL, bg=self.colors["bg"], borderwidth=0, sashwidth=4)
+        self.vertical_paned.pack(fill=tk.BOTH, expand=True)
+
+        # Horizontal Paned Window for 3 columns
+        self.main_paned = tk.PanedWindow(self.vertical_paned, orient=tk.HORIZONTAL, bg=self.colors["bg"], borderwidth=0, sashwidth=4)
+        self.vertical_paned.add(self.main_paned, stretch="always")
+
+        # Left Column: Projects
+        self.left_frame = tk.Frame(self.main_paned, bg=self.colors["sidebar_bg"], width=200)
+        self.main_paned.add(self.left_frame, stretch="never")
         self.setup_left_column()
+
+        # Center Column: Project Lists
+        self.center_frame = tk.Frame(self.main_paned, bg=self.colors["bg"], width=400)
+        self.main_paned.add(self.center_frame, stretch="always")
         self.setup_center_column()
+
+        # Right Column: All Fonts / Favorites
+        self.right_frame = tk.Frame(self.main_paned, bg=self.colors["bg"], width=400)
+        self.main_paned.add(self.right_frame, stretch="always")
         self.setup_right_column()
+
+        # Bottom Row: Custom Text Preview
+        self.bottom_frame = tk.Frame(self.vertical_paned, bg=self.colors["sidebar_bg"])
+        self.vertical_paned.add(self.bottom_frame, stretch="never", minsize=150)
         self.setup_bottom_row()
-        
-        self.arrange_layout()
-
-    def arrange_layout(self):
-        # Clear existing paned windows from root
-        for widget in list(self.root.winfo_children()):
-            if isinstance(widget, tk.PanedWindow):
-                try:
-                    widget.destroy()
-                except Exception:
-                    pass
-
-        try:
-            if self.full_width_preview:
-                # Mode A: Preview spans full width at bottom (Right column truncated)
-                self.main_v_paned = tk.PanedWindow(self.root, orient=tk.VERTICAL, bg=self.colors["bg"], borderwidth=0, sashwidth=4)
-                self.main_v_paned.pack(fill=tk.BOTH, expand=True)
-                
-                # In this version, we make nesting clear: PWs are siblings of the frames they manage
-                self.top_h_paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=self.colors["bg"], borderwidth=0, sashwidth=4)
-                
-                self.main_v_paned.add(self.top_h_paned, stretch="always")
-                self.top_h_paned.add(self.left_frame, stretch="never")
-                self.top_h_paned.add(self.center_frame, stretch="always")
-                self.top_h_paned.add(self.right_frame, stretch="always")
-                
-                self.main_v_paned.add(self.bottom_frame, stretch="never", minsize=150)
-                
-                self.layout_btn_right.pack(side=tk.BOTTOM, anchor="e", padx=5, pady=2)
-                self.layout_btn_bottom.pack_forget()
-            else:
-                # Mode B: Right column spans full height (Preview truncated)
-                self.main_h_paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=self.colors["bg"], borderwidth=0, sashwidth=4)
-                self.main_h_paned.pack(fill=tk.BOTH, expand=True)
-                
-                self.left_v_paned = tk.PanedWindow(self.root, orient=tk.VERTICAL, bg=self.colors["bg"], borderwidth=0, sashwidth=4)
-                self.main_h_paned.add(self.left_v_paned, stretch="always")
-                
-                self.top_h_paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=self.colors["bg"], borderwidth=0, sashwidth=4)
-                self.left_v_paned.add(self.top_h_paned, stretch="always")
-                
-                self.top_h_paned.add(self.left_frame, stretch="never")
-                self.top_h_paned.add(self.center_frame, stretch="always")
-                
-                self.left_v_paned.add(self.bottom_frame, stretch="never", minsize=150)
-                
-                self.main_h_paned.add(self.right_frame, stretch="always")
-                
-                self.layout_btn_right.pack_forget()
-                self.layout_btn_bottom.pack(side=tk.RIGHT, padx=5)
-        except Exception as e:
-            print(f"Error in arrange_layout: {e}")
-        
-        self.root.update_idletasks()
-        self.update_preview()
-
-    def toggle_layout(self):
-        self.save_to_history()
-        self.full_width_preview = not self.full_width_preview
-        self.arrange_layout()
 
     def setup_left_column(self):
         tk.Label(self.left_frame, text="PROJECTS", bg=self.colors["sidebar_bg"], fg="white", font=("Arial", 12, "bold")).pack(pady=10)
@@ -378,9 +335,6 @@ class KorianFontsManagerApp:
         
         self.fav_fonts_list = ScrollableFontList(self.fav_fonts_frame, self.colors, self.on_font_click, self.toggle_favorite, self)
         self.fav_fonts_list.pack(fill=tk.BOTH, expand=True)
-        
-        self.layout_btn_right = tk.Button(self.right_frame, text="↕", command=self.toggle_layout, 
-                                          bg=self.colors["bg"], fg="white", font=("Arial", 10, "bold"))
 
     def setup_bottom_row(self):
         # Tools row for colors, image upload, and bounding box toggle
@@ -410,10 +364,7 @@ class KorianFontsManagerApp:
         self.bg_hex_entry.bind("<FocusOut>", self.on_bg_hex_change)
         
         tk.Button(tools_frame, text="Upload BG", command=self.upload_bg_image, bg=self.colors["bg"], fg="white").pack(side=tk.LEFT, padx=2)
-        
-        self.layout_btn_bottom = tk.Button(tools_frame, text="↔", command=self.toggle_layout,
-                                           bg=self.colors["bg"], fg="white", font=("Arial", 10, "bold"))
-        
+
         # Bounding Box Checkbox
         tk.Checkbutton(tools_frame, text="Bounding Box", variable=self.show_bounding_box, command=self.update_preview, 
                        bg=self.colors["sidebar_bg"], fg="white", selectcolor=self.colors["bg"]).pack(side=tk.LEFT, padx=5)
