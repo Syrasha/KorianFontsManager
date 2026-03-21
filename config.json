@@ -1,0 +1,15 @@
+{
+    "custom_dirs": [],
+    "favorites": [
+        "Bahnschrift"
+    ],
+    "projects": {
+        "Test": {
+            "lists": {
+                "Default": [
+                    "Arial"
+                ]
+            }
+        }
+    }
+}
