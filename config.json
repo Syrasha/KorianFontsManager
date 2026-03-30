@@ -4,12 +4,16 @@
         "Bahnschrift"
     ],
     "projects": {
-        "Test": {
-            "lists": {
-                "Default": [
-                    "Arial"
-                ]
-            }
-        }
+        "Test": [
+            "Ink Free",
+            "Francois One",
+            "Paytone One",
+            "Ebrima",
+            "Wingdings"
+        ],
+        "test 2": [
+            "Ebrima",
+            "Wingdings"
+        ]
     }
 }
