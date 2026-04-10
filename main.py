@@ -1,10 +1,60 @@
 import os
 import json
 import ctypes
+from ctypes import wintypes
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font as tkfont, simpledialog, colorchooser
 from PIL import ImageFont, Image, ImageTk
 import threading
+
+# CHOOSECOLOR structure for Windows color dialog
+class CHOOSECOLOR(ctypes.Structure):
+    _fields_ = [
+        ("lStructSize", wintypes.DWORD),
+        ("hwndOwner", wintypes.HWND),
+        ("hInstance", wintypes.HWND),
+        ("rgbResult", wintypes.COLORREF),
+        ("lpCustColors", ctypes.POINTER(wintypes.COLORREF)),
+        ("Flags", wintypes.DWORD),
+        ("lCustData", wintypes.LPARAM),
+        ("lpfnHook", ctypes.c_void_p),
+        ("lpTemplateName", wintypes.LPCWSTR),
+    ]
+
+CC_FULLOPEN = 0x00000002
+CC_RGBINIT = 0x00000001
+
+def hex_to_colorref(color_str):
+    try:
+        # Use tk to resolve the color name or hex string to RGB
+        # tk._default_root is set after the first Tk instance is created.
+        root = getattr(tk, '_default_root', None)
+        if root:
+            r, g, b = root.winfo_rgb(color_str)
+            # winfo_rgb returns 16-bit values (0-65535). Convert to 8-bit (0-255).
+            r, g, b = r >> 8, g >> 8, b >> 8
+            return r | (g << 8) | (b << 16)
+    except Exception:
+        pass
+
+    # Fallback to manual hex parsing if tk is not available or resolution fails
+    color_str = str(color_str).lstrip('#')
+    if len(color_str) == 3:
+        color_str = ''.join([c*2 for c in color_str])
+    
+    try:
+        r = int(color_str[0:2], 16)
+        g = int(color_str[2:4], 16)
+        b = int(color_str[4:6], 16)
+        return r | (g << 8) | (b << 16)
+    except (ValueError, IndexError):
+        return 0 # Black fallback
+
+def colorref_to_hex(colorref):
+    r = colorref & 0xFF
+    g = (colorref >> 8) & 0xFF
+    b = (colorref >> 16) & 0xFF
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 # Font loading logic for Windows
 def load_font(font_path):
@@ -81,6 +131,7 @@ class ScrollableFontList(tk.Frame):
         self.on_fav = on_fav
         self.app = app
         self.show_add_btn = show_add_btn
+        self.row_height = 160
         
         self.canvas = tk.Canvas(self, bg=colors["list_bg"], highlightthickness=0)
         self.scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
@@ -88,11 +139,11 @@ class ScrollableFontList(tk.Frame):
         
         self.scrollable_frame.bind(
             "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            lambda e: [self.canvas.configure(scrollregion=self.canvas.bbox("all")), self.update_visible_rows()]
         )
         
         self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
         
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
@@ -138,9 +189,48 @@ class ScrollableFontList(tk.Frame):
 
     def on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
+        self.update_visible_rows()
+
+    def _on_canvas_scroll(self, first, last):
+        self.scrollbar.set(first, last)
+        self.update_visible_rows()
+
+    def update_visible_rows(self):
+        # Determine viewport
+        v_height = self.canvas.winfo_height()
+        if v_height <= 1:
+            return
+
+        v_top = self.canvas.canvasy(0)
+        v_bottom = v_top + v_height
+        
+        children = self.scrollable_frame.winfo_children()
+        for row in children:
+            try:
+                y = row.winfo_y()
+                h = row.winfo_height()
+            except:
+                continue
+            
+            # Use a generous buffer
+            is_visible = (y + h >= v_top - 800) and (y <= v_bottom + 800)
+            
+            if is_visible:
+                if not getattr(row, 'loaded', False):
+                    self._load_row(row)
+
+
+    def _load_row(self, row):
+        f_info = getattr(row, 'f_info', None)
+        if not f_info: return
+        row.pack_propagate(True)
+        self.create_row_content(row, f_info)
+        row.loaded = True
+
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        self.update_visible_rows()
 
     def reset_scroll(self):
         self.canvas.yview_moveto(0)
@@ -160,6 +250,8 @@ class ScrollableFontList(tk.Frame):
                 self.canvas.configure(bg=bg_color)
                 self.scrollable_frame.configure(bg=bg_color)
                 self.fonts_data = fonts
+                # Ensure visible rows are loaded/updated
+                self.update_visible_rows()
                 return
 
         self.fonts_data = fonts
@@ -182,7 +274,7 @@ class ScrollableFontList(tk.Frame):
         # Re-bind the configure event so the scroll region updates for the new frame
         new_frame.bind(
             "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            lambda e: [self.canvas.configure(scrollregion=self.canvas.bbox("all")), self.update_visible_rows()]
         )
         
         # Update backgrounds
@@ -192,26 +284,28 @@ class ScrollableFontList(tk.Frame):
         # Clean up the old frame
         if old_frame and old_frame != new_frame:
             old_frame.destroy()
+        
+        # Trigger initial loading of visible rows
+        self.after(10, self.update_visible_rows)
 
     def create_font_row(self, f_info):
         family = f_info.family
         bg_color = self.app.preview_bg
         
-        row = tk.Frame(self.scrollable_frame, bg=bg_color, pady=5, padx=10)
+        row = tk.Frame(self.scrollable_frame, bg=bg_color, pady=5, padx=10, height=self.row_height)
         row.pack(fill=tk.X)
+        row.pack_propagate(False)
+        
+        row.f_info = f_info
+        row.loaded = False
         
         # Enable dragging from the row components
         self.app.bind_font_drag(row, family)
+
+    def create_row_content(self, row, f_info):
+        family = f_info.family
+        bg_color = self.app.preview_bg
         
-        # Left side: Family name in small text
-        info_frame = tk.Frame(row, bg=bg_color)
-        info_frame.pack(side=tk.LEFT, padx=(0, 20))
-        self.app.bind_font_drag(info_frame, family)
-
-        name_lbl = tk.Label(info_frame, text=family, bg=bg_color, fg="#555555", font=("Arial", 8))
-        name_lbl.pack(anchor="w")
-        self.app.bind_font_drag(name_lbl, family)
-
         # Preview area using Canvas
         preview_canvas = tk.Canvas(row, bg=bg_color, highlightthickness=0, height=150)
         preview_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -226,8 +320,6 @@ class ScrollableFontList(tk.Frame):
         fav_btn.bind("<Button-1>", lambda e, f=family: [self.on_fav(f), self.canvas.focus_set()])
 
         # Store references for smart updates
-        row.info_frame = info_frame
-        row.name_lbl = name_lbl
         row.preview_canvas = preview_canvas
         row.fav_btn = fav_btn
 
@@ -257,18 +349,23 @@ class ScrollableFontList(tk.Frame):
             tx = bw + 5
 
         # Draw items
-        preview_canvas.create_text(tx, 10, text=preview_text, font=(family, font_size), 
-                                   fill=self.app.preview_fg, anchor=anchor, justify=align, 
-                                   width=bw if self.app.show_bounding_box.get() else 0, tags="text")
+        # Line 1: Font Name, Alpha, Punc
+        preview_canvas.create_text(tx, 10, text=family, font=("Arial", self.app.font_name_size),
+                                   fill=self.app.preview_fg, anchor=anchor, tags="font_name")
         
-        secondary_font = (family, 12)
+        secondary_font = (family, self.app.secondary_size)
         alpha_text = "AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz"
-        preview_canvas.create_text(tx, 50, text=alpha_text, font=secondary_font,
+        preview_canvas.create_text(tx, 10, text=alpha_text, font=secondary_font,
                                    fill=self.app.preview_fg, anchor=anchor, tags="secondary_alpha")
         
         punc_text = "1234567890 !?.,;:'\"()/\\{}[]-=_+~`@#$%^&*`\""
-        preview_canvas.create_text(tx, 70, text=punc_text, font=secondary_font,
+        preview_canvas.create_text(tx, 10, text=punc_text, font=secondary_font,
                                    fill=self.app.preview_fg, anchor=anchor, tags="secondary_punc")
+
+        # Line 2: Preview Text
+        preview_canvas.create_text(tx, 40, text=preview_text, font=(family, font_size), 
+                                   fill=self.app.preview_fg, anchor=anchor, justify=align, 
+                                   width=bw if self.app.show_bounding_box.get() else 0, tags="text")
         
         # Setup/Update bbox if enabled
         if self.app.show_bounding_box.get():
@@ -281,12 +378,15 @@ class ScrollableFontList(tk.Frame):
         self.app.bind_font_drag(preview_canvas, family)
 
     def update_font_row(self, row, f_info):
-        family = f_info.family
+        row.f_info = f_info
         bg_color = self.app.preview_bg
         
         row.configure(bg=bg_color)
-        row.info_frame.configure(bg=bg_color)
-        row.name_lbl.configure(bg=bg_color)
+        
+        if not getattr(row, 'loaded', False):
+            return
+            
+        family = f_info.family
         row.fav_btn.configure(bg=bg_color)
         
         star = "★" if f_info.is_favorite else "☆"
@@ -318,11 +418,13 @@ class ScrollableFontList(tk.Frame):
             tx = bw + 5
 
         # Update text items
+        c.itemconfig("font_name", text=family, font=("Arial", self.app.font_name_size), fill=self.app.preview_fg, anchor=anchor)
+        
         c.itemconfig("text", text=preview_text, font=(family, font_size), 
                      fill=self.app.preview_fg, anchor=anchor, justify=align, 
                      width=bw if self.app.show_bounding_box.get() else 0)
         
-        secondary_font = (family, 12)
+        secondary_font = (family, self.app.secondary_size)
         c.itemconfig("secondary_alpha", font=secondary_font, fill=self.app.preview_fg, anchor=anchor)
         c.itemconfig("secondary_punc", font=secondary_font, fill=self.app.preview_fg, anchor=anchor)
         
@@ -373,17 +475,57 @@ class ScrollableFontList(tk.Frame):
         c._drag_start = (e.x, e.y)
 
     def _update_canvas_layout(self, c, family, tx, anchor, align, bw, bh):
-        c.coords("text", tx, 10)
+        # Line 1 positioning
+        name_bbox = c.bbox("font_name")
+        alpha_bbox = c.bbox("secondary_alpha")
+        punc_bbox = c.bbox("secondary_punc")
+        
+        if not name_bbox or not alpha_bbox or not punc_bbox: return
+
+        spacing = 20
+        
+        if align == "left":
+            c.coords("font_name", tx, 10)
+            c.itemconfig("font_name", anchor="nw")
+            name_bbox = c.bbox("font_name")
+            c.coords("secondary_alpha", name_bbox[2] + spacing, 10)
+            c.itemconfig("secondary_alpha", anchor="nw")
+            alpha_bbox = c.bbox("secondary_alpha")
+            c.coords("secondary_punc", alpha_bbox[2] + spacing, 10)
+            c.itemconfig("secondary_punc", anchor="nw")
+        elif align == "center":
+            w_name = name_bbox[2] - name_bbox[0]
+            w_alpha = alpha_bbox[2] - alpha_bbox[0]
+            w_punc = punc_bbox[2] - punc_bbox[0]
+            total_w = w_name + w_alpha + w_punc + 2 * spacing
+            start_x = tx - total_w / 2
+            
+            c.coords("font_name", start_x, 10)
+            c.itemconfig("font_name", anchor="nw")
+            c.coords("secondary_alpha", start_x + w_name + spacing, 10)
+            c.itemconfig("secondary_alpha", anchor="nw")
+            c.coords("secondary_punc", start_x + w_name + spacing + w_alpha + spacing, 10)
+            c.itemconfig("secondary_punc", anchor="nw")
+        else: # right
+            c.coords("secondary_punc", tx, 10)
+            c.itemconfig("secondary_punc", anchor="ne")
+            punc_bbox = c.bbox("secondary_punc")
+            c.coords("secondary_alpha", punc_bbox[0] - spacing, 10)
+            c.itemconfig("secondary_alpha", anchor="ne")
+            alpha_bbox = c.bbox("secondary_alpha")
+            c.coords("font_name", alpha_bbox[0] - spacing, 10)
+            c.itemconfig("font_name", anchor="ne")
+
+        # Now place the main preview text below Line 1
+        line1_bbox = c.bbox("font_name", "secondary_alpha", "secondary_punc")
+        next_y = line1_bbox[3] + 10 if line1_bbox else 30
+        
+        c.coords("text", tx, next_y)
         c.itemconfig("text", anchor=anchor, justify=align)
         
-        text_bbox = c.bbox("text")
-        next_y = text_bbox[3] + 10 if text_bbox else 50
-        c.coords("secondary_alpha", tx, next_y)
-        c.coords("secondary_punc", tx, next_y + 20)
-        
         # Update canvas height
-        p_bbox = c.bbox("secondary_punc")
-        text_bottom = p_bbox[3] if p_bbox else 0
+        text_bbox = c.bbox("text")
+        text_bottom = text_bbox[3] if text_bbox else next_y
         h = text_bottom + 5
         if self.app.show_bounding_box.get():
             h = max(h, bh + 10)
@@ -537,7 +679,7 @@ class KorianFontsManagerApp:
         
         # Preview Settings
         self.preview_font_size = 72
-        self.preview_fg = "black"
+        self.preview_fg = "#000000"
         self.preview_bg = "#CCCCCC"
         self.bg_image = None
         self.bg_image_tk = None
@@ -545,9 +687,15 @@ class KorianFontsManagerApp:
         self.show_bounding_box = tk.BooleanVar(value=False)
         self.text_align = tk.StringVar(value="left")
         
-        # Per-font bounding box: family -> (width, height)
         self.font_bboxes = {}
         
+        self.font_name_size = 10
+        self.secondary_size = 10
+        
+        self.custom_colors = [0xFFFFFF] * 16 # Windows COLORREFs (BGR)
+        
+        self.current_families_filter = None
+        self.current_search_query = ""
         self._size_timer = None
         
         # History for Undo/Redo
@@ -567,12 +715,168 @@ class KorianFontsManagerApp:
         }
         
         self.root.configure(bg=self.colors["bg"])
+        self.setup_menu()
         self.setup_ui()
         self.ignore_history = False
         self.root.update()
         
         # Initial font scan
         threading.Thread(target=self.initial_font_scan, daemon=True).start()
+
+    def setup_menu(self):
+        self.menu_bar = tk.Menu(self.root)
+        self.root.config(menu=self.menu_bar)
+        
+        self.file_menu = tk.Menu(self.menu_bar, tearoff=0)
+        self.menu_bar.add_cascade(label="File", menu=self.file_menu)
+        
+        self.file_menu.add_command(label="Settings", command=self.show_settings_dialog)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Save Config", command=self.save_config)
+        self.file_menu.add_command(label="Load Config", command=self.load_config)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Exit", command=self.root.quit)
+
+    def show_settings_dialog(self):
+        settings_win = tk.Toplevel(self.root)
+        settings_win.title("Settings")
+        settings_win.geometry("400x500")
+        settings_win.configure(bg=self.colors["sidebar_bg"])
+        
+        tk.Label(settings_win, text="Font Elements Settings", bg=settings_win["bg"], fg="white", font=("Arial", 12, "bold")).pack(pady=10)
+        
+        # Slider for Font Name size
+        tk.Label(settings_win, text="Font Name Size:", bg=settings_win["bg"], fg="white").pack()
+        name_slider = ttk.Scale(settings_win, from_=6, to_=72, orient=tk.HORIZONTAL)
+        name_slider.set(self.font_name_size)
+        name_slider.pack(fill=tk.X, padx=20, pady=5)
+        
+        # Slider for Alphabet/Numbers size
+        tk.Label(settings_win, text="Alphabet/Numbers Size:", bg=settings_win["bg"], fg="white").pack()
+        sec_slider = ttk.Scale(settings_win, from_=6, to_=72, orient=tk.HORIZONTAL)
+        sec_slider.set(self.secondary_size)
+        sec_slider.pack(fill=tk.X, padx=20, pady=5)
+        
+        # Preview area
+        tk.Label(settings_win, text="Preview:", bg=settings_win["bg"], fg="white").pack(pady=(10, 0))
+        preview_frame = tk.Frame(settings_win, bg="white", height=100)
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        preview_frame.pack_propagate(False)
+        
+        preview_canvas = tk.Canvas(preview_frame, bg="white", highlightthickness=0)
+        preview_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        def update_preview_items(*args):
+            preview_canvas.delete("all")
+            n_size = int(name_slider.get())
+            s_size = int(sec_slider.get())
+            
+            # Draw name
+            preview_canvas.create_text(10, 10, text="Font Family Name", font=("Arial", n_size), anchor="nw", tags="name")
+            n_bbox = preview_canvas.bbox("name")
+            
+            # Draw alpha
+            preview_canvas.create_text(n_bbox[2] + 10, 10, text="AaBbCc 123", font=("Arial", s_size), anchor="nw")
+            
+            # Update app values
+            self.font_name_size = n_size
+            self.secondary_size = s_size
+            
+            # Trigger app update
+            self.update_font_lists(frequent=True)
+
+        name_slider.configure(command=update_preview_items)
+        sec_slider.configure(command=update_preview_items)
+        
+        # Initial draw
+        update_preview_items()
+        
+        tk.Button(settings_win, text="Close", command=settings_win.destroy).pack(pady=10)
+
+    def save_config(self):
+        config_name = simpledialog.askstring("Save Config", "Enter name for the config:")
+        if not config_name:
+            return
+            
+        if not os.path.exists("configs"):
+            os.makedirs("configs")
+            
+        path = os.path.join("configs", f"{config_name}.json")
+        
+        config = {
+            "preview_font_size": self.preview_font_size,
+            "preview_fg": self.preview_fg,
+            "preview_bg": self.preview_bg,
+            "bg_image_path": self.bg_image_path,
+            "show_bounding_box": self.show_bounding_box.get(),
+            "text_align": self.text_align.get(),
+            "preview_text": self.preview_text_box.get("1.0", "end-1c"),
+            "font_bboxes": self.font_bboxes,
+            "font_name_size": self.font_name_size,
+            "secondary_size": self.secondary_size,
+            "paned_sash": self.main_paned.sash_coord(0)[0],
+            "custom_colors": [colorref_to_hex(c) for c in self.custom_colors]
+        }
+        
+        try:
+            with open(path, 'w') as f:
+                json.dump(config, f, indent=4)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save config: {e}")
+
+    def load_config(self):
+        if not os.path.exists("configs"):
+            os.makedirs("configs")
+        path = filedialog.askopenfilename(initialdir="configs", filetypes=[("JSON files", "*.json")])
+        if not path:
+            return
+            
+        try:
+            with open(path, 'r') as f:
+                config = json.load(f)
+            
+            self.preview_font_size = config.get("preview_font_size", 72)
+            self.preview_fg = config.get("preview_fg", "#000000")
+            self.preview_bg = config.get("preview_bg", "#CCCCCC")
+            self.bg_image_path = config.get("bg_image_path")
+            self.show_bounding_box.set(config.get("show_bounding_box", False))
+            self.text_align.set(config.get("text_align", "left"))
+            
+            preview_text = config.get("preview_text", "Preview Text")
+            self.preview_text_box.delete("1.0", tk.END)
+            self.preview_text_box.insert("1.0", preview_text)
+            
+            self.font_bboxes = config.get("font_bboxes", {})
+            self.font_name_size = config.get("font_name_size", 10)
+            self.secondary_size = config.get("secondary_size", 10)
+            
+            hex_custom = config.get("custom_colors", ["#FFFFFF"] * 16)
+            self.custom_colors = [hex_to_colorref(h) for h in hex_custom]
+            
+            if self.bg_image_path and os.path.exists(self.bg_image_path):
+                try:
+                    self.bg_image = Image.open(self.bg_image_path)
+                    self.bg_image_tk = ImageTk.PhotoImage(self.bg_image)
+                except:
+                    self.bg_image = None
+                    self.bg_image_tk = None
+            else:
+                self.bg_image = None
+                self.bg_image_tk = None
+                
+            self.size_slider.set(self.preview_font_size)
+            self.fg_hex_entry.delete(0, tk.END)
+            self.fg_hex_entry.insert(0, self.preview_fg)
+            self.bg_hex_entry.delete(0, tk.END)
+            self.bg_hex_entry.insert(0, self.preview_bg)
+            
+            sash_pos = config.get("paned_sash")
+            if sash_pos:
+                self.main_paned.sash_place(0, sash_pos, 0)
+            
+            self.update_font_lists()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load config: {e}")
 
     def setup_ui(self):
         # Bind virtual event for font updates
@@ -688,6 +992,15 @@ class KorianFontsManagerApp:
         self.slider_frame = tk.Frame(self.right_frame)
         self.slider_frame.place(relx=1.0, x=-10, y=2, anchor="ne")
         
+        # Filter Box
+        tk.Label(self.slider_frame, text="Filter:", font=("Arial", 9)).pack(side=tk.LEFT, padx=(5, 2))
+        self.filter_entry = tk.Entry(self.slider_frame, width=15)
+        self.filter_entry.pack(side=tk.LEFT, padx=(0, 10))
+        self.filter_entry.bind("<KeyRelease>", self.on_filter_change)
+        self.filter_entry.bind("<Escape>", self.clear_filter)
+        self.root.bind("<Control-f>", lambda e: self.filter_entry.focus_set())
+        self.root.bind("<Control-F>", lambda e: self.filter_entry.focus_set())
+
         tk.Label(self.slider_frame, text="Size:", font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 2))
         self.size_slider = ttk.Scale(self.slider_frame, from_=8, to_=250, orient=tk.HORIZONTAL,
                                    length=80, command=self.on_size_slider_change)
@@ -743,6 +1056,10 @@ class KorianFontsManagerApp:
             "text_align": self.text_align.get(),
             "preview_text": self.preview_text_box.get("1.0", tk.END),
             "font_bboxes": self.font_bboxes,
+            "font_name_size": self.font_name_size,
+            "secondary_size": self.secondary_size,
+            "paned_sash": self.main_paned.sash_coord(0)[0],
+            "custom_colors": list(self.custom_colors),
             "sort_by_dir": getattr(self, "sort_by_dir", False),
             "right_tab_idx": self.right_notebook.index("current") if self.right_notebook.tabs() else 0
         }
@@ -785,7 +1102,14 @@ class KorianFontsManagerApp:
         self.preview_text_box.insert("1.0", p["preview_text"].strip())
         
         self.font_bboxes = p.get("font_bboxes", {})
+        self.font_name_size = p.get("font_name_size", 10)
+        self.secondary_size = p.get("secondary_size", 10)
+        self.custom_colors = p.get("custom_colors", [0xFFFFFF] * 16)
         
+        sash_pos = p.get("paned_sash")
+        if sash_pos:
+            self.main_paned.sash_place(0, sash_pos, 0)
+            
         self.sort_by_dir = p.get("sort_by_dir", False)
         
         # Synchronize Hex Entries
@@ -866,8 +1190,19 @@ class KorianFontsManagerApp:
             self.projects_tree.update_tree()
 
     def choose_fg_color(self):
-        color = colorchooser.askcolor(initialcolor=self.preview_fg)[1]
-        if color:
+        initial = hex_to_colorref(self.preview_fg)
+        cust_array = (wintypes.COLORREF * 16)(*self.custom_colors)
+        
+        cc = CHOOSECOLOR()
+        cc.lStructSize = ctypes.sizeof(CHOOSECOLOR)
+        cc.hwndOwner = self.root.winfo_id()
+        cc.rgbResult = initial
+        cc.lpCustColors = ctypes.cast(cust_array, ctypes.POINTER(wintypes.COLORREF))
+        cc.Flags = CC_FULLOPEN | CC_RGBINIT
+        
+        if ctypes.windll.comdlg32.ChooseColorW(ctypes.byref(cc)):
+            color = colorref_to_hex(cc.rgbResult)
+            self.custom_colors = list(cust_array)
             self.save_to_history()
             self.preview_fg = color
             self.fg_hex_entry.delete(0, tk.END)
@@ -883,8 +1218,19 @@ class KorianFontsManagerApp:
                 self.update_preview()
 
     def choose_bg_color(self):
-        color = colorchooser.askcolor(initialcolor=self.preview_bg)[1]
-        if color:
+        initial = hex_to_colorref(self.preview_bg)
+        cust_array = (wintypes.COLORREF * 16)(*self.custom_colors)
+        
+        cc = CHOOSECOLOR()
+        cc.lStructSize = ctypes.sizeof(CHOOSECOLOR)
+        cc.hwndOwner = self.root.winfo_id()
+        cc.rgbResult = initial
+        cc.lpCustColors = ctypes.cast(cust_array, ctypes.POINTER(wintypes.COLORREF))
+        cc.Flags = CC_FULLOPEN | CC_RGBINIT
+        
+        if ctypes.windll.comdlg32.ChooseColorW(ctypes.byref(cc)):
+            color = colorref_to_hex(cc.rgbResult)
+            self.custom_colors = list(cust_array)
             self.save_to_history()
             self.preview_bg = color
             self.bg_hex_entry.delete(0, tk.END)
@@ -956,14 +1302,15 @@ class KorianFontsManagerApp:
             self.current_families_filter = families_filter
             self.show_all_btn.place(x=180, y=2)
             reset_scroll = True
-        elif not hasattr(self, 'current_families_filter'):
-            self.current_families_filter = None
 
         with self.fonts_lock:
             if self.current_families_filter is not None:
                 all_fonts_list = [self.all_fonts[f] for f in self.current_families_filter if f in self.all_fonts]
             else:
                 all_fonts_list = list(self.all_fonts.values())
+            
+            if getattr(self, "current_search_query", ""):
+                all_fonts_list = [f for f in all_fonts_list if self.current_search_query in f.family.lower()]
             
         if getattr(self, "sort_by_dir", False):
             sorted_fonts = sorted(all_fonts_list, key=lambda x: (x.directory.lower(), x.family.lower()))
@@ -1112,6 +1459,15 @@ class KorianFontsManagerApp:
                 self.save_to_history()
         # Always update the newly selected tab to ensure it's in sync
         self.update_font_lists()
+
+    def on_filter_change(self, event=None):
+        self.current_search_query = self.filter_entry.get().lower()
+        self.update_font_lists(reset_scroll=True)
+
+    def clear_filter(self, event=None):
+        self.filter_entry.delete(0, tk.END)
+        self.on_filter_change()
+        self.root.focus_set()
 
 if __name__ == "__main__":
     root = tk.Tk()
